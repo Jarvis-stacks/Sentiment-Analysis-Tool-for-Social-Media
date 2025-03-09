@@ -1,0 +1,40 @@
+from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey, DateTime
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, relationship
+from sqlalchemy.sql import func
+
+DATABASE_URL = "sqlite:///./sentiment.db"
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True, nullable=False)
+    hashed_password = Column(String, nullable=False)
+    email = Column(String, unique=True, nullable=True)
+    full_name = Column(String, nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    last_login = Column(DateTime, nullable=True)
+    analyses = relationship("Analysis", back_populates="user")
+
+class Analysis(Base):
+    __tablename__ = "analyses"
+    id = Column(Integer, primary_key=True, index=True)
+    text = Column(String, nullable=False)
+    sentiment = Column(String, nullable=False)
+    confidence = Column(Float, nullable=False)
+    model_used = Column(String, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=func.now())
+    user = relationship("User", back_populates="analyses")
+
+Base.metadata.create_all(bind=engine)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
