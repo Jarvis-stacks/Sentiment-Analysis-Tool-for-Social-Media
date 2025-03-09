@@ -1,24 +1,30 @@
-# Import necessary modules
 import logging
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, Depends, HTTPException, Form, Request, status, File, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey
+from pydantic import BaseModel, EmailStr, Field
+from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
+from sqlalchemy.sql import func
 from transformers import pipeline
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 import os
 import csv
 from io import StringIO
+import json
+import uvicorn
+import re
+import shutil
+import tempfile
+from starlette.middleware.cors import CORSMiddleware
 
-# Configure logging
+# --- Logging Configuration ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -29,59 +35,73 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Application configuration
-DATABASE_URL = "sqlite:///./sentiment.db"
+# --- Application Configuration ---
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./sentiment.db")
 SECRET_KEY = os.getenv("SECRET_KEY", "your-very-secure-secret-key-here")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
-ALLOWED_MODELS = ["default", "distilbert"]
+REFRESH_TOKEN_EXPIRE_DAYS = 7
+ALLOWED_MODELS = ["default", "distilbert", "roberta"]
+UPLOAD_DIR = "uploads"
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 
-# Initialize FastAPI app
+# --- Initialize FastAPI App ---
 app = FastAPI(
-    title="Sentiment Analysis Tool",
-    description="A comprehensive tool for analyzing text sentiment using Hugging Face models.",
-    version="1.0.0"
+    title="Advanced Sentiment Analysis Tool",
+    description="A comprehensive tool for text sentiment analysis with user management and batch processing.",
+    version="1.1.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
 )
 
-# Set up templates and static files
+# --- CORS Middleware ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Templates and Static Files ---
 templates = Jinja2Templates(directory="templates")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# Database setup
+# --- Ensure Upload Directory Exists ---
+if not os.path.exists(UPLOAD_DIR):
+    os.makedirs(UPLOAD_DIR)
+
+# --- Database Setup ---
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# Database Models
+# --- Database Models ---
 class User(Base):
-    """
-    Database model for users.
-    
-    Attributes:
-        id (int): Primary key for the user.
-        username (str): Unique username.
-        hashed_password (str): Hashed password for security.
-        analyses (relationship): Relationship to user's analyses.
-    """
+    """User model for storing user information."""
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)
+    email = Column(String, unique=True, index=True, nullable=True)
+    full_name = Column(String, nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    last_login = Column(DateTime, nullable=True)
     analyses = relationship("Analysis", back_populates="user")
+    preferences = relationship("UserPreference", uselist=False, back_populates="user")
+
+class UserPreference(Base):
+    """User preferences for customization."""
+    __tablename__ = "user_preferences"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False)
+    default_model = Column(String, default="default")
+    theme = Column(String, default="light")
+    notifications_enabled = Column(String, default="yes")
+    user = relationship("User", back_populates="preferences")
 
 class Analysis(Base):
-    """
-    Database model for sentiment analyses.
-    
-    Attributes:
-        id (int): Primary key for the analysis.
-        text (str): Input text analyzed.
-        sentiment (str): Predicted sentiment (e.g., POSITIVE, NEGATIVE).
-        confidence (float): Confidence score of the prediction.
-        model_used (str): Model used for analysis.
-        user_id (int): Foreign key to the user who performed the analysis.
-        user (relationship): Relationship to the user.
-    """
+    """Analysis model for storing sentiment analysis results."""
     __tablename__ = "analyses"
     id = Column(Integer, primary_key=True, index=True)
     text = Column(String, nullable=False)
@@ -89,153 +109,98 @@ class Analysis(Base):
     confidence = Column(Float, nullable=False)
     model_used = Column(String, nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=func.now())
     user = relationship("User", back_populates="analyses")
 
-# Create database tables
 Base.metadata.create_all(bind=engine)
 
-# Pydantic Models for API validation
+# --- Pydantic Models ---
 class Token(BaseModel):
-    """Model for authentication token response."""
     access_token: str
     token_type: str
+    refresh_token: str
 
 class TokenData(BaseModel):
-    """Model for token payload data."""
     username: Optional[str] = None
 
 class UserCreate(BaseModel):
-    """Model for user registration input."""
-    username: str
-    password: str
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=8)
+    email: Optional[EmailStr] = None
+    full_name: Optional[str] = None
 
-class UserInDB(BaseModel):
-    """Model for user data in the database."""
-    username: str
-    hashed_password: str
+class UserUpdate(BaseModel):
+    email: Optional[EmailStr] = None
+    full_name: Optional[str] = None
+    password: Optional[str] = Field(None, min_length=8)
+
+class UserPreferenceUpdate(BaseModel):
+    default_model: Optional[str] = None
+    theme: Optional[str] = None
+    notifications_enabled: Optional[str] = None
 
 class AnalysisResponse(BaseModel):
-    """Model for single analysis response."""
+    id: int
     text: str
     sentiment: str
     confidence: float
     model_used: str
+    created_at: datetime
 
-# Dependency to get database session
+class BatchAnalysisRequest(BaseModel):
+    texts: List[str]
+    model: str = "default"
+
+# --- Database Dependency ---
 def get_db():
-    """
-    Dependency function to provide a database session.
-    
-    Yields:
-        Session: SQLAlchemy session object.
-    """
+    """Provide a database session."""
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
-        logger.debug("Database session closed.")
 
-# Authentication setup
+# --- Authentication Setup ---
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """
-    Verify a plain password against a hashed password.
-    
-    Args:
-        plain_password (str): The password to verify.
-        hashed_password (str): The stored hashed password.
-    
-    Returns:
-        bool: True if the password matches, False otherwise.
-    """
-    logger.debug(f"Verifying password for hashed_password: {hashed_password[:10]}...")
+    """Verify a plain password against a hashed password."""
     return pwd_context.verify(plain_password, hashed_password)
 
 def get_password_hash(password: str) -> str:
-    """
-    Hash a plain password.
-    
-    Args:
-        password (str): The password to hash.
-    
-    Returns:
-        str: The hashed password.
-    """
-    logger.debug("Generating password hash.")
+    """Hash a password for storage."""
     return pwd_context.hash(password)
 
 def get_user(db: Session, username: str) -> Optional[User]:
-    """
-    Retrieve a user from the database by username.
-    
-    Args:
-        db (Session): Database session.
-        username (str): Username to search for.
-    
-    Returns:
-        Optional[User]: User object if found, None otherwise.
-    """
-    logger.debug(f"Fetching user: {username}")
+    """Retrieve a user by username."""
     return db.query(User).filter(User.username == username).first()
 
 def authenticate_user(db: Session, username: str, password: str) -> Optional[User]:
-    """
-    Authenticate a user with username and password.
-    
-    Args:
-        db (Session): Database session.
-        username (str): User's username.
-        password (str): User's password.
-    
-    Returns:
-        Optional[User]: Authenticated user object, or None if authentication fails.
-    """
-    logger.info(f"Attempting to authenticate user: {username}")
+    """Authenticate a user with username and password."""
     user = get_user(db, username)
     if not user or not verify_password(password, user.hashed_password):
-        logger.warning(f"Authentication failed for user: {username}")
         return None
-    logger.info(f"User {username} authenticated successfully.")
+    user.last_login = datetime.utcnow()
+    db.commit()
     return user
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
-    """
-    Create a JWT access token.
-    
-    Args:
-        data (dict): Data to encode in the token.
-        expires_delta (Optional[timedelta]): Token expiration time delta.
-    
-    Returns:
-        str: Encoded JWT token.
-    """
+    """Create a JWT access token."""
     to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    logger.debug(f"Created access token expiring at: {expire}")
-    return encoded_jwt
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire, "type": "access"})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def create_refresh_token(data: dict) -> str:
+    """Create a JWT refresh token."""
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    to_encode.update({"exp": expire, "type": "refresh"})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
-    """
-    Get the current authenticated user from the token.
-    
-    Args:
-        token (str): JWT token from the request.
-        db (Session): Database session.
-    
-    Returns:
-        User: Authenticated user object.
-    
-    Raises:
-        HTTPException: If token is invalid or user not found.
-    """
+    """Get the current authenticated user from the token."""
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
@@ -243,82 +208,128 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
     )
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("type") != "access":
+            raise credentials_exception
         username: str = payload.get("sub")
         if username is None:
-            logger.error("Token payload missing 'sub' field.")
             raise credentials_exception
-        token_data = TokenData(username=username)
-    except JWTError as e:
-        logger.error(f"JWT decode error: {str(e)}")
+    except JWTError:
         raise credentials_exception
-    user = get_user(db, username=token_data.username)
+    user = get_user(db, username)
     if user is None:
-        logger.error(f"User not found for username: {token_data.username}")
         raise credentials_exception
-    logger.debug(f"Current user retrieved: {user.username}")
     return user
 
-# Sentiment Analysis Service
+# --- Sentiment Analysis Service ---
 class SentimentService:
-    """
-    Service class for handling sentiment analysis using Hugging Face models.
-    
-    Attributes:
-        models (dict): Dictionary of loaded sentiment analysis models.
-    """
+    """Service for handling sentiment analysis with multiple models."""
     def __init__(self):
-        """Initialize the sentiment service with pre-trained models."""
-        logger.info("Initializing SentimentService with pre-trained models.")
         self.models = {
             "default": pipeline("sentiment-analysis"),
             "distilbert": pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english"),
+            "roberta": pipeline("sentiment-analysis", model="roberta-base"),
         }
-        logger.info("Sentiment models loaded successfully.")
+        logger.info("Sentiment models initialized.")
 
     def analyze(self, text: str, model_name: str = "default") -> tuple[str, float]:
-        """
-        Analyze the sentiment of a given text.
-        
-        Args:
-            text (str): Text to analyze.
-            model_name (str): Name of the model to use.
-        
-        Returns:
-            tuple[str, float]: Sentiment label and confidence score.
-        
-        Raises:
-            ValueError: If the model name is invalid.
-        """
+        """Analyze the sentiment of a given text."""
+        if not text.strip():
+            raise ValueError("Text cannot be empty.")
         if model_name not in self.models:
-            logger.error(f"Invalid model name requested: {model_name}")
             raise ValueError(f"Model '{model_name}' not available. Choose from {list(self.models.keys())}")
-        logger.info(f"Analyzing text with model: {model_name}")
-        result = self.models[model_name](text)[0]
-        sentiment = result["label"]
-        confidence = result["score"]
-        logger.debug(f"Analysis result - Text: {text[:50]}..., Sentiment: {sentiment}, Confidence: {confidence}")
-        return sentiment, confidence
+        try:
+            result = self.models[model_name](text)[0]
+            return result["label"], result["score"]
+        except Exception as e:
+            logger.error(f"Sentiment analysis failed: {str(e)}")
+            raise HTTPException(status_code=500, detail="Analysis failed due to internal error.")
 
-# Instantiate the sentiment service
 sentiment_service = SentimentService()
 
-# Authentication Routes
+# --- Helper Functions ---
+def create_user(db: Session, user: UserCreate) -> User:
+    """Create a new user in the database."""
+    if not re.match(r"^[a-zA-Z0-9_]+$", user.username):
+        raise HTTPException(status_code=400, detail="Username can only contain letters, numbers, and underscores.")
+    hashed_password = get_password_hash(user.password)
+    db_user = User(username=user.username, hashed_password=hashed_password, email=user.email, full_name=user.full_name)
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    # Create default preferences
+    db_prefs = UserPreference(user_id=db_user.id)
+    db.add(db_prefs)
+    db.commit()
+    logger.info(f"User '{user.username}' created successfully.")
+    return db_user
+
+def update_user(db: Session, username: str, user_update: UserUpdate) -> User:
+    """Update an existing user's information."""
+    db_user = get_user(db, username)
+    if not db_user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user_update.email:
+        db_user.email = user_update.email
+    if user_update.full_name:
+        db_user.full_name = user_update.full_name
+    if user_update.password:
+        db_user.hashed_password = get_password_hash(user_update.password)
+    db.commit()
+    db.refresh(db_user)
+    logger.info(f"User '{username}' updated successfully.")
+    return db_user
+
+def delete_user(db: Session, username: str) -> None:
+    """Delete a user from the database."""
+    db_user = get_user(db, username)
+    if not db_user:
+        raise HTTPException(status_code=404, detail="User not found")
+    db.delete(db_user)
+    db.commit()
+    logger.info(f"User '{username}' deleted successfully.")
+
+def create_analysis(db: Session, text: str, sentiment: str, confidence: float, model_used: str, user_id: int) -> Analysis:
+    """Create a new analysis record."""
+    analysis = Analysis(text=text, sentiment=sentiment, confidence=confidence, model_used=model_used, user_id=user_id)
+    db.add(analysis)
+    db.commit()
+    db.refresh(analysis)
+    return analysis
+
+def get_analyses(db: Session, user_id: int, skip: int = 0, limit: int = 100) -> List[Analysis]:
+    """Retrieve a user's analysis history."""
+    return db.query(Analysis).filter(Analysis.user_id == user_id).order_by(Analysis.created_at.desc()).offset(skip).limit(limit).all()
+
+def delete_analysis(db: Session, analysis_id: int, user_id: int) -> None:
+    """Delete a specific analysis record."""
+    analysis = db.query(Analysis).filter(Analysis.id == analysis_id, Analysis.user_id == user_id).first()
+    if not analysis:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+    db.delete(analysis)
+    db.commit()
+    logger.info(f"Analysis ID {analysis_id} deleted by user ID {user_id}.")
+
+def update_user_preferences(db: Session, user_id: int, prefs: UserPreferenceUpdate) -> UserPreference:
+    """Update user preferences."""
+    db_prefs = db.query(UserPreference).filter(UserPreference.user_id == user_id).first()
+    if not db_prefs:
+        db_prefs = UserPreference(user_id=user_id)
+        db.add(db_prefs)
+    if prefs.default_model and prefs.default_model in ALLOWED_MODELS:
+        db_prefs.default_model = prefs.default_model
+    if prefs.theme in ["light", "dark"]:
+        db_prefs.theme = prefs.theme
+    if prefs.notifications_enabled in ["yes", "no"]:
+        db_prefs.notifications_enabled = prefs.notifications_enabled
+    db.commit()
+    db.refresh(db_prefs)
+    logger.info(f"Preferences updated for user ID {user_id}.")
+    return db_prefs
+
+# --- Authentication Routes ---
 @app.post("/token", response_model=Token)
 async def login_for_access_token(db: Session = Depends(get_db), form_data: OAuth2PasswordRequestForm = Depends()):
-    """
-    Endpoint to generate an access token for authenticated users.
-    
-    Args:
-        db (Session): Database session.
-        form_data (OAuth2PasswordRequestForm): Login form data.
-    
-    Returns:
-        dict: Token response with access_token and token_type.
-    
-    Raises:
-        HTTPException: If authentication fails.
-    """
-    logger.info(f"Login attempt for user: {form_data.username}")
+    """Generate access and refresh tokens for user login."""
     user = authenticate_user(db, form_data.username, form_data.password)
     if not user:
         raise HTTPException(
@@ -326,175 +337,108 @@ async def login_for_access_token(db: Session = Depends(get_db), form_data: OAuth
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": user.username}, expires_delta=access_token_expires
+    access_token = create_access_token(data={"sub": user.username})
+    refresh_token = create_refresh_token(data={"sub": user.username})
+    return {"access_token": access_token, "token_type": "bearer", "refresh_token": refresh_token}
+
+@app.post("/refresh", response_model=Token)
+async def refresh_access_token(refresh_token: str = Form(...), db: Session = Depends(get_db)):
+    """Refresh an access token using a refresh token."""
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid refresh token",
+        headers={"WWW-Authenticate": "Bearer"},
     )
-    logger.info(f"Token generated for user: {user.username}")
-    return {"access_token": access_token, "token_type": "bearer"}
+    try:
+        payload = jwt.decode(refresh_token, SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("type") != "refresh":
+            raise credentials_exception
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    user = get_user(db, username)
+    if not user:
+        raise credentials_exception
+    access_token = create_access_token(data={"sub": user.username})
+    new_refresh_token = create_refresh_token(data={"sub": user.username})
+    return {"access_token": access_token, "token_type": "bearer", "refresh_token": new_refresh_token}
 
-@app.post("/register", response_class=HTMLResponse)
-async def register(
-    request: Request,
-    username: str = Form(...),
-    password: str = Form(...),
-    db: Session = Depends(get_db)
-):
-    """
-    Endpoint to register a new user.
-    
-    Args:
-        request (Request): FastAPI request object.
-        username (str): New user's username.
-        password (str): New user's password.
-        db (Session): Database session.
-    
-    Returns:
-        HTMLResponse: Registration success or failure page.
-    
-    Raises:
-        HTTPException: If username is already taken.
-    """
-    logger.info(f"Registration attempt for username: {username}")
-    existing_user = get_user(db, username)
-    if existing_user:
-        logger.warning(f"Username already registered: {username}")
-        return templates.TemplateResponse(
-            "register.html",
-            {"request": request, "error": "Username already registered"}
-        )
-    hashed_password = get_password_hash(password)
-    new_user = User(username=username, hashed_password=hashed_password)
-    db.add(new_user)
-    db.commit()
-    logger.info(f"User registered successfully: {username}")
-    return templates.TemplateResponse(
-        "register.html",
-        {"request": request, "message": "Registration successful! Please log in."}
-    )
+@app.post("/register", response_model=Token)
+async def register(user: UserCreate, db: Session = Depends(get_db)):
+    """Register a new user and return tokens."""
+    if get_user(db, user.username):
+        raise HTTPException(status_code=400, detail="Username already registered")
+    create_user(db, user)
+    access_token = create_access_token(data={"sub": user.username})
+    refresh_token = create_refresh_token(data={"sub": user.username})
+    return {"access_token": access_token, "token_type": "bearer", "refresh_token": refresh_token}
 
-# Frontend Routes
-@app.get("/", response_class=HTMLResponse)
-async def home(request: Request):
-    """
-    Home page of the sentiment analysis tool.
-    
-    Args:
-        request (Request): FastAPI request object.
-    
-    Returns:
-        HTMLResponse: Rendered home page template.
-    """
-    logger.debug("Serving home page.")
-    return templates.TemplateResponse("home.html", {"request": request})
+# --- User Management Routes ---
+@app.get("/users/me", response_model=Dict[str, Any])
+async def read_users_me(current_user: User = Depends(get_current_user)):
+    """Retrieve current user's information."""
+    return {
+        "username": current_user.username,
+        "email": current_user.email,
+        "full_name": current_user.full_name,
+        "created_at": current_user.created_at,
+        "last_login": current_user.last_login
+    }
 
-@app.get("/login", response_class=HTMLResponse)
-async def login_page(request: Request):
-    """
-    Login page for user authentication.
-    
-    Args:
-        request (Request): FastAPI request object.
-    
-    Returns:
-        HTMLResponse: Rendered login page template.
-    """
-    logger.debug("Serving login page.")
-    return templates.TemplateResponse("login.html", {"request": request})
-
-@app.get("/register", response_class=HTMLResponse)
-async def register_page(request: Request):
-    """
-    Registration page for new users.
-    
-    Args:
-        request (Request): FastAPI request object.
-    
-    Returns:
-        HTMLResponse: Rendered registration page template.
-    """
-    logger.debug("Serving register page.")
-    return templates.TemplateResponse("register.html", {"request": request})
-
-@app.get("/analyze", response_class=HTMLResponse)
-async def analyze_page(request: Request, current_user: User = Depends(get_current_user)):
-    """
-    Page for single text sentiment analysis.
-    
-    Args:
-        request (Request): FastAPI request object.
-        current_user (User): Authenticated user.
-    
-    Returns:
-        HTMLResponse: Rendered analysis page template.
-    """
-    logger.debug(f"Serving analyze page for user: {current_user.username}")
-    return templates.TemplateResponse(
-        "analyze.html",
-        {"request": request, "models": ALLOWED_MODELS}
-    )
-
-@app.get("/batch", response_class=HTMLResponse)
-async def batch_page(request: Request, current_user: User = Depends(get_current_user)):
-    """
-    Page for batch sentiment analysis.
-    
-    Args:
-        request (Request): FastAPI request object.
-        current_user (User): Authenticated user.
-    
-    Returns:
-        HTMLResponse: Rendered batch analysis page template.
-    """
-    logger.debug(f"Serving batch analysis page for user: {current_user.username}")
-    return templates.TemplateResponse("batch.html", {"request": request})
-
-@app.get("/history", response_class=HTMLResponse)
-async def history_page(
-    request: Request,
+@app.put("/users/me", response_model=Dict[str, Any])
+async def update_users_me(
+    user_update: UserUpdate,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Page to view user's analysis history.
-    
-    Args:
-        request (Request): FastAPI request object.
-        current_user (User): Authenticated user.
-        db (Session): Database session.
-    
-    Returns:
-        HTMLResponse: Rendered history page template with analysis data.
-    """
-    logger.debug(f"Serving history page for user: {current_user.username}")
-    analyses = db.query(Analysis).filter(Analysis.user_id == current_user.id).all()
-    return templates.TemplateResponse(
-        "history.html",
-        {"request": request, "analyses": analyses}
-    )
+    """Update current user's information."""
+    updated_user = update_user(db, current_user.username, user_update)
+    return {
+        "username": updated_user.username,
+        "email": updated_user.email,
+        "full_name": updated_user.full_name,
+        "created_at": updated_user.created_at,
+        "last_login": updated_user.last_login
+    }
 
-@app.get("/profile", response_class=HTMLResponse)
-async def profile_page(
-    request: Request,
-    current_user: User = Depends(get_current_user)
+@app.delete("/users/me")
+async def delete_users_me(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Delete the current user."""
+    delete_user(db, current_user.username)
+    return {"message": "User deleted successfully"}
+
+@app.get("/users/preferences", response_model=Dict[str, str])
+async def get_user_preferences(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Retrieve user preferences."""
+    prefs = db.query(UserPreference).filter(UserPreference.user_id == current_user.id).first()
+    if not prefs:
+        prefs = UserPreference(user_id=current_user.id)
+        db.add(prefs)
+        db.commit()
+        db.refresh(prefs)
+    return {
+        "default_model": prefs.default_model,
+        "theme": prefs.theme,
+        "notifications_enabled": prefs.notifications_enabled
+    }
+
+@app.put("/users/preferences", response_model=Dict[str, str])
+async def update_user_preferences(
+    prefs: UserPreferenceUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
 ):
-    """
-    User profile page.
-    
-    Args:
-        request (Request): FastAPI request object.
-        current_user (User): Authenticated user.
-    
-    Returns:
-        HTMLResponse: Rendered profile page template.
-    """
-    logger.debug(f"Serving profile page for user: {current_user.username}")
-    return templates.TemplateResponse(
-        "profile.html",
-        {"request": request, "user": current_user}
-    )
+    """Update user preferences."""
+    updated_prefs = update_user_preferences(db, current_user.id, prefs)
+    return {
+        "default_model": updated_prefs.default_model,
+        "theme": updated_prefs.theme,
+        "notifications_enabled": updated_prefs.notifications_enabled
+    }
 
-# API Routes
+# --- Analysis Routes ---
 @app.post("/api/analyze", response_model=AnalysisResponse)
 async def analyze(
     text: str = Form(...),
@@ -502,46 +446,20 @@ async def analyze(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    API endpoint to analyze sentiment of a single text.
-    
-    Args:
-        text (str): Text to analyze.
-        model (str): Model to use for analysis.
-        db (Session): Database session.
-        current_user (User): Authenticated user.
-    
-    Returns:
-        AnalysisResponse: Sentiment analysis result.
-    
-    Raises:
-        HTTPException: If model is invalid or analysis fails.
-    """
-    logger.info(f"Analyzing text for user: {current_user.username} with model: {model}")
+    """Analyze the sentiment of a single text."""
     try:
         sentiment, confidence = sentiment_service.analyze(text, model)
-        analysis = Analysis(
-            text=text,
-            sentiment=sentiment,
-            confidence=confidence,
-            model_used=model,
-            user_id=current_user.id
-        )
-        db.add(analysis)
-        db.commit()
-        logger.info(f"Analysis saved for user: {current_user.username}")
+        analysis = create_analysis(db, text, sentiment, confidence, model, current_user.id)
         return {
-            "text": text,
-            "sentiment": sentiment,
-            "confidence": confidence,
-            "model_used": model
+            "id": analysis.id,
+            "text": analysis.text,
+            "sentiment": analysis.sentiment,
+            "confidence": analysis.confidence,
+            "model_used": analysis.model_used,
+            "created_at": analysis.created_at
         }
     except ValueError as e:
-        logger.error(f"Analysis error: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error(f"Unexpected error during analysis: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/api/batch_analyze", response_model=List[AnalysisResponse])
 async def batch_analyze(
@@ -550,123 +468,162 @@ async def batch_analyze(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    API endpoint to analyze sentiment of multiple texts from a file.
-    
-    Args:
-        file (UploadFile): Uploaded file containing texts (CSV format).
-        model (str): Model to use for analysis.
-        db (Session): Database session.
-        current_user (User): Authenticated user.
-    
-    Returns:
-        List[AnalysisResponse]: List of sentiment analysis results.
-    
-    Raises:
-        HTTPException: If file format is invalid or analysis fails.
-    """
-    logger.info(f"Batch analysis requested by user: {current_user.username} with model: {model}")
+    """Analyze sentiments of multiple texts from a CSV file."""
     if not file.filename.endswith('.csv'):
-        logger.error("Invalid file format. Only CSV files are supported.")
         raise HTTPException(status_code=400, detail="Only CSV files are supported.")
-    
-    contents = await file.read()
-    text_data = contents.decode("utf-8")
-    csv_reader = csv.reader(StringIO(text_data))
-    results = []
-    
+    if file.size > MAX_FILE_SIZE:
+        raise HTTPException(status_code=400, detail=f"File size exceeds {MAX_FILE_SIZE // (1024 * 1024)}MB limit.")
+    with tempfile.NamedTemporaryFile(delete=False, dir=UPLOAD_DIR, suffix=".csv") as tmp:
+        shutil.copyfileobj(file.file, tmp)
+        tmp_path = tmp.name
     try:
-        for row in csv_reader:
-            if not row or not row[0].strip():
-                continue  # Skip empty rows
-            text = row[0]
-            sentiment, confidence = sentiment_service.analyze(text, model)
-            analysis = Analysis(
-                text=text,
-                sentiment=sentiment,
-                confidence=confidence,
-                model_used=model,
-                user_id=current_user.id
-            )
-            db.add(analysis)
-            results.append({
-                "text": text,
-                "sentiment": sentiment,
-                "confidence": confidence,
-                "model_used": model
-            })
-        db.commit()
-        logger.info(f"Batch analysis completed for {len(results)} texts.")
+        results = []
+        with open(tmp_path, 'r', encoding='utf-8') as f:
+            csv_reader = csv.reader(f)
+            next(csv_reader, None)  # Skip header if exists
+            for row in csv_reader:
+                if not row or not row[0].strip():
+                    continue
+                text = row[0]
+                sentiment, confidence = sentiment_service.analyze(text, model)
+                analysis = create_analysis(db, text, sentiment, confidence, model, current_user.id)
+                results.append({
+                    "id": analysis.id,
+                    "text": analysis.text,
+                    "sentiment": analysis.sentiment,
+                    "confidence": analysis.confidence,
+                    "model_used": analysis.model_used,
+                    "created_at": analysis.created_at
+                })
         return results
     except ValueError as e:
-        logger.error(f"Batch analysis error: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error(f"Unexpected error during batch analysis: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+    finally:
+        os.remove(tmp_path)
 
-@app.get("/api/analyses", response_model=List[AnalysisResponse])
-async def list_analyses(
+@app.post("/api/batch_analyze_json", response_model=List[AnalysisResponse])
+async def batch_analyze_json(
+    request: BatchAnalysisRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    API endpoint to list all analyses for the current user.
-    
-    Args:
-        db (Session): Database session.
-        current_user (User): Authenticated user.
-    
-    Returns:
-        List[AnalysisResponse]: List of user's analyses.
-    """
-    logger.debug(f"Fetching analysis history for user: {current_user.username}")
-    analyses = db.query(Analysis).filter(Analysis.user_id == current_user.id).all()
+    """Analyze sentiments of multiple texts from a JSON request."""
+    results = []
+    try:
+        for text in request.texts:
+            sentiment, confidence = sentiment_service.analyze(text, request.model)
+            analysis = create_analysis(db, text, sentiment, confidence, request.model, current_user.id)
+            results.append({
+                "id": analysis.id,
+                "text": analysis.text,
+                "sentiment": analysis.sentiment,
+                "confidence": analysis.confidence,
+                "model_used": analysis.model_used,
+                "created_at": analysis.created_at
+            })
+        return results
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/analyses", response_model=List[AnalysisResponse])
+async def list_analyses(
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """List a user's analysis history."""
+    analyses = get_analyses(db, current_user.id, skip, limit)
     return [
         {
-            "text": analysis.text,
-            "sentiment": analysis.sentiment,
-            "confidence": analysis.confidence,
-            "model_used": analysis.model_used
+            "id": a.id,
+            "text": a.text,
+            "sentiment": a.sentiment,
+            "confidence": a.confidence,
+            "model_used": a.model_used,
+            "created_at": a.created_at
         }
-        for analysis in analyses
+        for a in analyses
     ]
 
 @app.delete("/api/analysis/{analysis_id}")
-async def delete_analysis(
+async def delete_analysis_route(
     analysis_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    API endpoint to delete a specific analysis.
-    
-    Args:
-        analysis_id (int): ID of the analysis to delete.
-        db (Session): Database session.
-        current_user (User): Authenticated user.
-    
-    Returns:
-        dict: Success message.
-    
-    Raises:
-        HTTPException: If analysis is not found or not owned by the user.
-    """
-    logger.info(f"Delete request for analysis ID: {analysis_id} by user: {current_user.username}")
-    analysis = db.query(Analysis).filter(
-        Analysis.id == analysis_id,
-        Analysis.user_id == current_user.id
-    ).first()
-    if not analysis:
-        logger.error(f"Analysis ID: {analysis_id} not found or not owned by user.")
-        raise HTTPException(status_code=404, detail="Analysis not found")
-    db.delete(analysis)
-    db.commit()
-    logger.info(f"Analysis ID: {analysis_id} deleted successfully.")
+    """Delete a specific analysis."""
+    delete_analysis(db, analysis_id, current_user.id)
     return {"message": "Analysis deleted successfully"}
 
-# Run the application (for local testing)
+# --- Model Management Routes ---
+@app.get("/api/models", response_model=List[str])
+async def list_models():
+    """List available sentiment analysis models."""
+    return list(sentiment_service.models.keys())
+
+@app.post("/api/models/{model_name}")
+async def select_model(model_name: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Select a default model for the user."""
+    if model_name not in sentiment_service.models:
+        raise HTTPException(status_code=400, detail="Model not available")
+    prefs = update_user_preferences(db, current_user.id, UserPreferenceUpdate(default_model=model_name))
+    return {"message": f"Model '{model_name}' set as default", "default_model": prefs.default_model}
+
+# --- Health Check and Statistics ---
+@app.get("/api/health")
+async def health_check(db: Session = Depends(get_db)):
+    """Check the health of the application."""
+    try:
+        db.execute("SELECT 1")
+        return {"status": "healthy", "database": "connected", "models": list(sentiment_service.models.keys())}
+    except Exception as e:
+        logger.error(f"Health check failed: {str(e)}")
+        return JSONResponse(status_code=500, content={"status": "unhealthy", "detail": str(e)})
+
+@app.get("/api/stats", response_model=Dict[str, Any])
+async def get_user_stats(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Retrieve user statistics."""
+    total_analyses = db.query(Analysis).filter(Analysis.user_id == current_user.id).count()
+    model_usage = db.query(Analysis.model_used, func.count(Analysis.id)).filter(Analysis.user_id == current_user.id).group_by(Analysis.model_used).all()
+    return {
+        "total_analyses": total_analyses,
+        "model_usage": {model: count for model, count in model_usage},
+        "last_login": current_user.last_login
+    }
+
+# --- UI Routes ---
+@app.get("/", response_class=HTMLResponse)
+async def read_root(request: Request):
+    """Render the home page."""
+    return templates.TemplateResponse("index.html", {"request": request})
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard(request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Render the user dashboard."""
+    prefs = db.query(UserPreference).filter(UserPreference.user_id == current_user.id).first()
+    return templates.TemplateResponse(
+        "dashboard.html",
+        {"request": request, "username": current_user.username, "theme": prefs.theme if prefs else "light"}
+    )
+
+# --- Error Handling ---
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Handle HTTP exceptions."""
+    if request.headers.get("accept") == "application/json":
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    return templates.TemplateResponse("error.html", {"request": request, "detail": exc.detail}, status_code=exc.status_code)
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    """Handle uncaught exceptions."""
+    logger.error(f"Unhandled exception: {str(exc)}", exc_info=True)
+    if request.headers.get("accept") == "application/json":
+        return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+    return templates.TemplateResponse("error.html", {"request": request, "detail": "Internal server error"}, status_code=500)
+
+# --- Application Entry Point ---
 if __name__ == "__main__":
-    import uvicorn
-    logger.info("Starting FastAPI application...")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    logger.info("Starting Sentiment Analysis Tool...")
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
